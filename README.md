@@ -20,6 +20,9 @@ MLS provides advanced security features including:
 * The **ratchet tree** structure used for group key derivation (TreeKEM)
 * **Path secrets**, **copath encryption**, and **epoch key schedules**
 * Simplified examples of **group creation**, **updates**, and **commits**
+* **Proper UpdatePath handling** with sender node public keys
+* **Confirmation tag validation** using HMAC-SHA256
+* **Tree public key installation** after commits
 
 This implementation focuses on **clarity and pedagogy**, not production security.
 It’s meant for engineers and students who want to **understand MLS by building it**.
