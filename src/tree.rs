@@ -78,9 +78,7 @@ impl RatchetTree {
         // For each internal node, compute a parent key
         // In a real implementation, this would involve proper key derivation
         for i in (0..self.size - 1).rev() {
-            if let (Some(left_child), Some(right_child)) =
-                (self.left_child_index(i), self.right_child_index(i))
-            {
+            if let (Some(left_child), Some(right_child)) = (self.left(i), self.right(i)) {
                 // Simplified: use hash of children's public keys
                 let left_pk = self.get_node_public_key(left_child);
                 let right_pk = self.get_node_public_key(right_child);
@@ -218,32 +216,6 @@ impl RatchetTree {
         } else {
             None
         }
-    }
-
-    // ===== Legacy Methods (for backward compatibility) =====
-
-    /// Get the leaf index from a node index
-    pub fn leaf_index(&self, node_index: NodeIndex) -> Option<LeafIndex> {
-        if self.is_leaf(node_index) {
-            Some(node_index - (self.size - 1))
-        } else {
-            None
-        }
-    }
-
-    /// Get the parent index of a node (legacy method)
-    pub fn parent_index(&self, node_index: NodeIndex) -> Option<NodeIndex> {
-        self.parent(node_index)
-    }
-
-    /// Get the left child index of a node (legacy method)
-    pub fn left_child_index(&self, node_index: NodeIndex) -> Option<NodeIndex> {
-        self.left(node_index)
-    }
-
-    /// Get the right child index of a node (legacy method)
-    pub fn right_child_index(&self, node_index: NodeIndex) -> Option<NodeIndex> {
-        self.right(node_index)
     }
 
     // ===== Dynamic Tree Operations =====
