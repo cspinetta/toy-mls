@@ -353,6 +353,77 @@ impl RatchetTree {
         }
         count
     }
+
+    /// Pretty-print the tree as ASCII structure
+    ///
+    /// Displays the current in-memory tree layout showing each node's
+    /// index, type (Parent/Leaf/Blank), and short public key prefix.
+    /// This helps visualize tree evolution across commits.
+    ///
+    /// # Example
+    /// ```
+    /// let tree = RatchetTree::new(3);
+    /// tree.print_ascii(); // prints 3-leaf tree layout
+    /// ```
+    ///
+    /// Output (for N=3):
+    /// ```text
+    /// Level 0: [ 0] Parent(...)
+    /// Level 1: [ 1] Parent(...) [ 2] Leaf(2)
+    /// Level 2: [ 3] Leaf(0) [ 4] Leaf(1)
+    /// ```
+    pub fn print_ascii(&self) {
+        use std::fmt::Write;
+
+        println!("\n=== Current Ratchet Tree ===");
+
+        let mut level_start = 0;
+        let mut level_size = 1;
+        let mut level = 0;
+        let mut output = String::new();
+
+        while level_start < self.nodes.len() {
+            write!(&mut output, "Level {}: ", level).unwrap();
+
+            for i in level_start..(level_start + level_size).min(self.nodes.len()) {
+                match &self.nodes[i] {
+                    Node::Blank => write!(&mut output, "[{:2}] Blank  ", i).unwrap(),
+                    Node::Parent { node_pk } => {
+                        write!(
+                            &mut output,
+                            "[{:2}] Parent({:02x?})  ",
+                            i,
+                            &node_pk[..4]
+                        )
+                        .unwrap();
+                    }
+                    Node::Leaf { leaf_pk, .. } => {
+                        let leaf_idx = if self.size > 0 && i >= self.size - 1 {
+                            i - (self.size - 1)
+                        } else {
+                            i
+                        };
+                        write!(
+                            &mut output,
+                            "[{:2}] Leaf({}) {:02x?}  ",
+                            i,
+                            leaf_idx,
+                            &leaf_pk[..4]
+                        )
+                        .unwrap();
+                    }
+                }
+            }
+
+            output.push('\n');
+            level_start += level_size;
+            level_size *= 2;
+            level += 1;
+        }
+
+        println!("{}", output);
+        println!("============================\n");
+    }
 }
 
 // ===== RFC 9420 Tree Math Implementation =====

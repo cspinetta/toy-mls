@@ -54,22 +54,8 @@ fn main() {
 
     // Step 3: Show tree structure
     println!("🌳 Step 3: Tree Structure");
-    println!("Initial ratchet tree structure:\n");
-
-    println!("        Root (0)");
-    println!("       /        \\");
-    println!("   Parent (1)   Parent (2)");
-    println!("   /      \\     /      \\");
-    println!("Leaf(3) Leaf(4) Leaf(5) Leaf(6)");
-    println!("  A       B       C       D");
-    println!("         (empty)");
-    println!();
-
-    println!("For N=3 members, we have:");
-    println!("- Alice (A) at leaf 3");
-    println!("- Bob (B) at leaf 4");
-    println!("- Charlie (C) at leaf 5");
-    println!("- Leaf 6 is empty (unused)\n");
+    println!("Visualizing the actual in-memory tree:\n");
+    alice_state.tree.print_ascii();
 
     // Step 4: Show direct paths and copaths
     println!("🛤️  Step 4: Direct Paths and Copaths");
@@ -78,25 +64,25 @@ fn main() {
     let tree = &alice_state.tree;
 
     // Alice's paths
-    let alice_dirpath = tree.dirpath(3);
-    let alice_copath = tree.copath(3);
-    println!("Alice (leaf 3):");
+    let alice_dirpath = tree.dirpath(0);
+    let alice_copath = tree.copath(0);
+    println!("Alice (leaf 0):");
     println!("  Direct path: {:?} (path to root)", alice_dirpath);
     println!("  Copath: {:?} (siblings of direct path)", alice_copath);
     println!();
 
     // Bob's paths
-    let bob_dirpath = tree.dirpath(4);
-    let bob_copath = tree.copath(4);
-    println!("Bob (leaf 4):");
+    let bob_dirpath = tree.dirpath(1);
+    let bob_copath = tree.copath(1);
+    println!("Bob (leaf 1):");
     println!("  Direct path: {:?} (path to root)", bob_dirpath);
     println!("  Copath: {:?} (siblings of direct path)", bob_copath);
     println!();
 
     // Charlie's paths
-    let charlie_dirpath = tree.dirpath(5);
-    let charlie_copath = tree.copath(5);
-    println!("Charlie (leaf 5):");
+    let charlie_dirpath = tree.dirpath(2);
+    let charlie_copath = tree.copath(2);
+    println!("Charlie (leaf 2):");
     println!("  Direct path: {:?} (path to root)", charlie_dirpath);
     println!("  Copath: {:?} (siblings of direct path)", charlie_copath);
     println!();
@@ -126,19 +112,12 @@ fn main() {
     println!("✅ David added to the group");
     println!("✅ New tree hash: {:02x?}", alice_state.context.tree_hash);
     println!("✅ New epoch: {}", alice_state.context.epoch);
-    println!("✅ David is now leaf 6");
+    println!("✅ David is now leaf 3");
     println!();
 
     // Show updated tree structure
-    println!("Updated tree structure:");
-    println!("        Root (0)");
-    println!("       /        \\");
-    println!("   Parent (1)   Parent (2)");
-    println!("   /      \\     /      \\");
-    println!("Leaf(3) Leaf(4) Leaf(5) Leaf(6)");
-    println!("  A       B       C       D");
-    println!("                        (David)");
-    println!();
+    println!("Updated tree structure after adding David:");
+    alice_state.tree.print_ascii();
 
     // Step 7: Demonstrate empty commit
     println!("🔄 Step 7: Empty Commit");
