@@ -1,21 +1,25 @@
 //! MLS secrets management
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use rand::Rng;
-use rand::rngs::OsRng;
+use rand::{Rng, rngs::OsRng};
 use x25519_dalek::{PublicKey, StaticSecret};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
-/// X25519 key pair for ECDH operations
-#[derive(Clone, Debug)]
+/// X25519 key pair for HPKE-style operations
+///
+/// The private key (sk) is automatically zeroized when dropped to prevent
+/// it from lingering in memory.
+#[derive(Clone, Debug, Zeroize, ZeroizeOnDrop)]
 pub struct KeyPair {
     pub sk: [u8; 32],
     pub pk: [u8; 32],
 }
 
 impl KeyPair {
-    /// Generate a new random X25519 key pair
+    /// Generate a new random X25519 key pair for HPKE-style operations
     pub fn generate() -> Self {
-        let sk = StaticSecret::random_from_rng(OsRng);
+        let rng = OsRng;
+        let sk = StaticSecret::random_from_rng(rng);
         let pk = PublicKey::from(&sk);
 
         Self {
@@ -26,6 +30,9 @@ impl KeyPair {
 }
 
 /// Ed25519 signature key pair for authentication
+///
+/// The signing key (sk) is automatically zeroized when dropped.
+/// Note: SigningKey from ed25519_dalek already implements ZeroizeOnDrop.
 #[derive(Clone, Debug)]
 pub struct SigKeyPair {
     pub sk: SigningKey,
@@ -47,7 +54,10 @@ impl SigKeyPair {
 }
 
 /// MLS epoch secrets
-#[derive(Clone, Debug)]
+///
+/// These secrets are automatically zeroized when dropped to prevent them
+/// from lingering in memory.
+#[derive(Clone, Debug, Zeroize, ZeroizeOnDrop)]
 pub struct Secrets {
     pub epoch: [u8; 32],
     pub handshake_key: [u8; 32],
@@ -59,7 +69,6 @@ impl Secrets {
     /// Generate new epoch secrets
     pub fn new() -> Self {
         let mut rng = OsRng;
-
         Self {
             epoch: rng.r#gen(),
             handshake_key: rng.r#gen(),
@@ -88,8 +97,8 @@ mod tests {
         assert_eq!(keypair.pk.len(), 32);
 
         // Verify public key can be derived from private key
-        let sk = x25519_dalek::StaticSecret::from(keypair.sk);
-        let pk = x25519_dalek::PublicKey::from(&sk);
+        let sk = StaticSecret::from(keypair.sk);
+        let pk = PublicKey::from(&sk);
         assert_eq!(keypair.pk, pk.to_bytes());
     }
 
@@ -111,8 +120,8 @@ mod tests {
         let keypair = KeyPair::generate();
 
         // Test that we can reconstruct the keypair from bytes
-        let sk = x25519_dalek::StaticSecret::from(keypair.sk);
-        let pk = x25519_dalek::PublicKey::from(&sk);
+        let sk = StaticSecret::from(keypair.sk);
+        let pk = PublicKey::from(&sk);
 
         assert_eq!(keypair.sk, sk.to_bytes());
         assert_eq!(keypair.pk, pk.to_bytes());
@@ -164,5 +173,51 @@ mod tests {
 
         // They should be different (random)
         assert_ne!(secrets1.epoch, secrets2.epoch);
+    }
+
+    #[test]
+    fn test_secrets_zeroization() {
+        let secrets = Secrets::new();
+        let epoch_secret = secrets.epoch;
+        let handshake_key = secrets.handshake_key;
+        let app_key = secrets.app_key;
+        let conf_key = secrets.conf_key;
+
+        // Verify secrets are not zero initially
+        assert_ne!(epoch_secret, [0u8; 32]);
+        assert_ne!(handshake_key, [0u8; 32]);
+        assert_ne!(app_key, [0u8; 32]);
+        assert_ne!(conf_key, [0u8; 32]);
+
+        // The secrets will be zeroized when dropped (tested by the zeroize crate)
+        // This test mainly verifies that the zeroize derive works without compilation errors
+    }
+
+    #[test]
+    fn test_keypair_zeroization() {
+        let keypair = KeyPair::generate();
+        let sk = keypair.sk;
+        let pk = keypair.pk;
+
+        // Verify keys are not zero initially
+        assert_ne!(sk, [0u8; 32]);
+        assert_ne!(pk, [0u8; 32]);
+
+        // The private key will be zeroized when dropped (tested by the zeroize crate)
+        // This test mainly verifies that the zeroize derive works without compilation errors
+    }
+
+    #[test]
+    fn test_sigkeypair_zeroization() {
+        let sig_keypair = SigKeyPair::generate();
+        let sk_bytes = sig_keypair.sk.to_bytes();
+        let pk_bytes = sig_keypair.pk.to_bytes();
+
+        // Verify keys are not zero initially
+        assert_ne!(sk_bytes, [0u8; 32]);
+        assert_ne!(pk_bytes, [0u8; 32]);
+
+        // The signing key will be zeroized when dropped (tested by the zeroize crate)
+        // This test mainly verifies that the zeroize derive works without compilation errors
     }
 }

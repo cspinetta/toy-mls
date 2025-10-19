@@ -49,13 +49,83 @@ Clone the repository and explore the examples:
 git clone https://github.com/cspinetta/toy-mls.git
 cd toy-mls
 
-# Run basic examples
-cargo run --example basic_usage
-cargo run --example group_operations
-cargo run --example path_secrets
+# Run examples
+cargo run --example mls_tour               # Complete MLS walkthrough with N=3 group
+cargo run --example tree_operations        # Complete binary tree functionality and navigation
+cargo run --example dynamic_membership     # Add/remove members and empty commits
+cargo run --example real_copath_test       # Real copath public keys (not mock keys)
+cargo run --example tree_math_comparison   # Compare educational vs RFC tree math
 ```
 
-Each example demonstrates a specific aspect of MLS, such as ratchet trees, path secret derivation, or group commit processing.
+Each example demonstrates a specific aspect of MLS:
+
+- **`mls_tour`**: Complete walkthrough of MLS operations with detailed explanations and visual output
+- **`tree_operations`**: Shows how the ratchet tree structure works, including node navigation, direct paths, and copaths
+- **`dynamic_membership`**: Demonstrates group lifecycle operations like adding/removing members and empty commits
+- **`real_copath_test`**: Tests actual copath encryption/decryption with real public keys instead of mock data
+- **`tree_math_comparison`**: Compares the educational heap-style tree math with the RFC 9420 compliant implementation
+
+## Documentation
+
+The project includes comprehensive documentation to help learners understand MLS concepts:
+
+- **`docs/direct-path-copath.md`**: Visual explanation of direct paths vs copaths in MLS TreeKEM
+- **Inline RFC references**: All key functions include references to relevant RFC 9420 sections
+- **Educational comments**: Code is extensively commented to explain MLS concepts
+
+## Testing
+
+The project includes comprehensive testing to ensure both the educational implementation and RFC 9420 compliant implementation for tree indexing work correctly.
+
+### Running Tests
+
+```bash
+# Run all tests (both implementations)
+make test-all
+
+# Run tests with default features (educational tree math)
+make test-default
+
+# Run tests with RFC treemath feature enabled
+make test-rfc
+
+# Run all checks (format, clippy, tests)
+make check
+```
+
+### Test Coverage
+
+The test suite includes:
+
+- **36 unit tests** - Core functionality and edge cases
+- **6 integration tests** - End-to-end MLS operations
+- **4 security property tests** - Convergence, forward secrecy, post-compromise security
+- **8 signature and error tests** - Ed25519 signatures and error handling
+- **7 wire format tests** - CBOR serialization/deserialization
+- **5 RFC treemath tests** - RFC 9420 compliant tree math (when feature enabled)
+
+### Tree Math Implementations
+
+The project supports two tree math implementations:
+
+1. **Default (Educational)**: Heap-style tree structure that's easy to understand and visualize
+2. **RFC 9420**: Exact specification-compliant implementation with left-balanced trees
+
+Both implementations are tested to ensure they work correctly:
+
+```bash
+# Compare both implementations
+cargo run --example tree_math_comparison                    # Default
+cargo run --example tree_math_comparison --features rfc_treemath  # RFC 9420
+```
+
+### Continuous Integration
+
+The project includes GitHub Actions CI that:
+- Tests both tree math implementations
+- Runs clippy and formatting checks
+- Performs security audits
+- Builds documentation
 
 ## License
 

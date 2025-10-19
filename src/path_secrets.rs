@@ -1,22 +1,24 @@
 //! Path secrets derivation for MLS (MLS TreeKEM)
 
 use crate::crypto::KeyPair;
+use crate::error::{MlsError, MlsResult};
 use crate::messages::CipherForSubtree;
 use crate::tree::LeafIndex;
+use chacha20poly1305::aead::{AeadInPlace, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+use hkdf::Hkdf;
 use rand::{Rng, rngs::OsRng};
+use sha2::Sha256;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 /// Derive path secrets from a leaf up to the root
 ///
-/// Implements the MLS path secret derivation as defined in RFC 9420 §7.4.
+/// Implements MLS path secret derivation as defined in RFC 9420 §7.4.
 /// Derives path secrets using HKDF-Expand with the "mls10 path" label.
 ///
-/// # Arguments
-/// * `_leaf_idx` - The leaf index to start from
-/// * `path_len` - Length of the path (number of secrets to derive)
-///
-/// # Returns
-/// Vector of path secrets s[i] from leaf to root
+/// # RFC 9420 Reference
+/// - Section 7.4: Path Secret Derivation
+/// - Section 7.2: TreeKEM Overview
 pub fn derive_path_up(_leaf_idx: LeafIndex, path_len: usize) -> Vec<[u8; 32]> {
     let mut path_secrets = Vec::new();
 
@@ -36,16 +38,17 @@ pub fn derive_path_up(_leaf_idx: LeafIndex, path_len: usize) -> Vec<[u8; 32]> {
 
 /// Derive node key pair from a path secret
 ///
-/// # Arguments
-/// * `path_secret` - The path secret s[i]
+/// Implements MLS node key derivation as defined in RFC 9420 §7.4.
+/// Derives node secret using HKDF-Expand with the "mls10 node" label.
 ///
-/// # Returns
-/// X25519 key pair derived from the secret
+/// # RFC 9420 Reference
+/// - Section 7.4: Path Secret Derivation
+/// - Section 7.2: TreeKEM Overview
 pub fn node_keys_from_path(path_secret: &[u8; 32]) -> KeyPair {
     // Derive node secret: node_secret = HKDF-Expand(s[i], "mls10 node", 32)
     let node_secret = hkdf_expand(path_secret, b"mls10 node", 32);
 
-    // Convert to X25519 key pair
+    // Convert to X25519 key pair (HPKE-style)
     let sk = StaticSecret::from(node_secret);
     let pk = PublicKey::from(&sk);
 
@@ -55,20 +58,28 @@ pub fn node_keys_from_path(path_secret: &[u8; 32]) -> KeyPair {
     }
 }
 
-/// Encrypt path secrets to copath subtrees
+/// Encrypt path secrets to copath subtrees using HPKE-style encryption
 ///
-/// # Arguments
-/// * `path_secrets` - Vector of path secrets to encrypt
-/// * `sender_node_keys` - Vector of sender node key pairs
-/// * `copath_subtrees` - Vector of copath subtree public keys
+/// Implements MLS path secret encryption as defined in RFC 9420 §7.4.
+/// Encrypts path secrets to copath subtrees using HPKE-style patterns.
 ///
-/// # Returns
-/// Vector of encrypted secrets for each copath subtree
-/// Each CipherForSubtree corresponds to one copath node, not all combinations
+/// This implementation follows HPKE patterns using compatible dependencies:
+/// - X25519 for key exchange
+/// - HKDF for key derivation  
+/// - ChaCha20-Poly1305 for AEAD encryption
+/// - AAD binding for context security
+///
+/// # RFC 9420 Reference
+/// - Section 7.4: Path Secret Derivation
+/// - Section 7.2: TreeKEM Overview
+/// - Section 7.3: Update Paths
 pub fn encrypt_to_copaths(
     path_secrets: &[[u8; 32]],
     sender_node_keys: &[KeyPair],
     copath_subtrees: &[[u8; 32]],
+    group_id: [u8; 16],
+    epoch: u64,
+    node_indices: &[usize],
 ) -> Vec<CipherForSubtree> {
     let mut encrypted_secrets = Vec::new();
 
@@ -78,22 +89,27 @@ pub fn encrypt_to_copaths(
         let path_secret = path_secrets
             .get(subtree_idx)
             .expect("Path secret missing for copath level");
+
+        // Create AAD: group_id || epoch || node_index as u32
+        let node_index = node_indices.get(subtree_idx).copied().unwrap_or(0) as u32;
+        let mut aad = Vec::new();
+        aad.extend_from_slice(&group_id);
+        aad.extend_from_slice(&epoch.to_be_bytes());
+        aad.extend_from_slice(&node_index.to_be_bytes());
+
+        // HPKE-style key derivation: shared = DH(sender_sk, recipient_pk)
         let sender_sk = StaticSecret::from(sender_node_keys[subtree_idx].sk);
+        let recipient_pk = PublicKey::from(subtree_pk);
+        let shared = sender_sk.diffie_hellman(&recipient_pk);
 
-        // Sender: uses node[i] private key and copath public keys.
-        // Recipient: uses their subtree private key and sender node[i] public key.
+        // HPKE-style key/nonce derivation: key = HKDF-Expand(shared, "mls10 hpke-key", 32)
+        let key = hkdf_expand(shared.as_bytes(), b"mls10 hpke-key", 32);
+        let nonce_bytes = hkdf_expand(shared.as_bytes(), b"mls10 hpke-nonce", 32);
+        let mut nonce = [0u8; 12];
+        nonce.copy_from_slice(&nonce_bytes[..12]);
 
-        // Generate shared secret: shared = X25519(sender_node_sk, subtree_pk)
-        let shared = sender_sk.diffie_hellman(&PublicKey::from(subtree_pk));
-
-        // Derive AEAD key: aead_key = HKDF-Expand(shared, "mls10 hpke-key", 32)
-        let aead_key = hkdf_expand(&shared.to_bytes(), b"mls10 hpke-key", 32);
-
-        // Generate nonce (in real implementation, this would be proper nonce generation)
-        let nonce = generate_nonce();
-
-        // Encrypt the path secret for this copath node
-        let ciphertext = encrypt_aead(&aead_key, &nonce, path_secret);
+        // Encrypt with ChaCha20-Poly1305 using AAD
+        let ciphertext = encrypt_with_ad(&key, &nonce, path_secret, &aad);
 
         encrypted_secrets.push(CipherForSubtree {
             recipient_subtree_node: subtree_idx,
@@ -105,44 +121,46 @@ pub fn encrypt_to_copaths(
     encrypted_secrets
 }
 
-/// Decrypt path secret from encrypted ciphertext
+/// Decrypt path secret from encrypted ciphertext using HPKE-style decryption
 ///
-/// # Arguments
-/// * `subtree_sk` - Recipient subtree private key
-/// * `sender_node_pk` - Sender node public key
-/// * `nonce` - Nonce used for encryption
-/// * `ct` - Encrypted ciphertext
+/// Implements MLS path secret decryption as defined in RFC 9420 §7.4.
+/// Decrypts path secrets from copath subtrees using HPKE-style patterns.
 ///
-/// # Returns
-/// Decrypted path secret s[i]
+/// # RFC 9420 Reference
+/// - Section 7.4: Path Secret Derivation
+/// - Section 7.2: TreeKEM Overview
+/// - Section 7.3: Update Paths
 pub fn decrypt_start_secret(
     subtree_sk: &[u8; 32],
     sender_node_pk: &[u8; 32],
     nonce: &[u8; 12],
     ct: &[u8],
-) -> Result<[u8; 32], String> {
-    // Sender: uses node[i] private key and copath public keys.
-    // Recipient: uses their subtree private key and sender node[i] public key.
+    group_id: [u8; 16],
+    epoch: u64,
+    node_index: u32,
+) -> MlsResult<[u8; 32]> {
+    // Create AAD: group_id || epoch || node_index as u32
+    let mut aad = Vec::new();
+    aad.extend_from_slice(&group_id);
+    aad.extend_from_slice(&epoch.to_be_bytes());
+    aad.extend_from_slice(&node_index.to_be_bytes());
 
-    // Generate shared secret: shared = X25519(recipient_sk, sender_pk)
+    // HPKE-style key derivation: shared = DH(recipient_sk, sender_pk)
     let recipient_sk = StaticSecret::from(*subtree_sk);
     let sender_pk = PublicKey::from(*sender_node_pk);
     let shared = recipient_sk.diffie_hellman(&sender_pk);
 
-    // Derive AEAD key: aead_key = HKDF-Expand(shared, "mls10 hpke-key", 32)
-    let aead_key = hkdf_expand(&shared.to_bytes(), b"mls10 hpke-key", 32);
+    // HPKE-style key derivation: key = HKDF-Expand(shared, "mls10 hpke-key", 32)
+    let key = hkdf_expand(shared.as_bytes(), b"mls10 hpke-key", 32);
 
-    // Decrypt the ciphertext
-    decrypt_aead(&aead_key, nonce, ct).map_err(|e| format!("Decryption failed: {}", e))
+    // Decrypt with ChaCha20-Poly1305 using AAD
+    decrypt_with_ad(&key, nonce, ct, &aad)
 }
 
 // ===== Helper Functions =====
 
 /// HKDF-Expand implementation
 fn hkdf_expand(prk: &[u8], info: &[u8], length: usize) -> [u8; 32] {
-    use hkdf::Hkdf;
-    use sha2::Sha256;
-
     let hk = Hkdf::<Sha256>::from_prk(prk).expect("Invalid PRK length");
     let mut okm = vec![0u8; length];
     hk.expand(info, &mut okm).expect("HKDF expand failed");
@@ -152,44 +170,60 @@ fn hkdf_expand(prk: &[u8], info: &[u8], length: usize) -> [u8; 32] {
     result
 }
 
-/// Generate a random nonce
-fn generate_nonce() -> [u8; 12] {
-    use rand::{Rng, rngs::OsRng};
-    let mut rng = OsRng;
-    rng.r#gen()
+/// Encrypt data with ChaCha20-Poly1305 using AAD
+// Suppress deprecation warning: chacha20poly1305 crate uses older generic-array internally
+// This is a transitive dependency issue, not our code using deprecated APIs
+#[allow(deprecated)]
+fn encrypt_with_ad(key: &[u8; 32], nonce: &[u8; 12], plaintext: &[u8], aad: &[u8]) -> Vec<u8> {
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
+    let nonce = Nonce::from_slice(nonce);
+
+    let mut buffer = plaintext.to_vec();
+    let tag = cipher
+        .encrypt_in_place_detached(nonce, aad, &mut buffer)
+        .expect("Encryption failed");
+
+    // Append the authentication tag
+    buffer.extend_from_slice(&tag);
+    buffer
 }
 
-/// Encrypt using ChaCha20-Poly1305
+/// Decrypt data with ChaCha20-Poly1305 using AAD
+// Suppress deprecation warning: chacha20poly1305 crate uses older generic-array internally
+// This is a transitive dependency issue, not our code using deprecated APIs
 #[allow(deprecated)]
-fn encrypt_aead(key: &[u8; 32], nonce: &[u8; 12], plaintext: &[u8]) -> Vec<u8> {
-    use chacha20poly1305::aead::{Aead, KeyInit};
-    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+fn decrypt_with_ad(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    ciphertext: &[u8],
+    aad: &[u8],
+) -> MlsResult<[u8; 32]> {
+    if ciphertext.len() < 16 {
+        return Err(MlsError::DecryptionError(
+            "Ciphertext too short".to_string(),
+        ));
+    }
 
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
     let nonce = Nonce::from_slice(nonce);
 
-    cipher.encrypt(nonce, plaintext).expect("Encryption failed")
-}
+    // Split ciphertext and tag
+    let (ct, tag) = ciphertext.split_at(ciphertext.len() - 16);
+    let mut buffer = ct.to_vec();
 
-/// Decrypt using ChaCha20-Poly1305
-#[allow(deprecated)]
-fn decrypt_aead(key: &[u8; 32], nonce: &[u8; 12], ciphertext: &[u8]) -> Result<[u8; 32], String> {
-    use chacha20poly1305::aead::{Aead, KeyInit};
-    use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
+    cipher
+        .decrypt_in_place_detached(nonce, aad, &mut buffer, tag.into())
+        .map_err(|_| MlsError::DecryptionError("Decryption failed".to_string()))?;
 
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
-    let nonce = Nonce::from_slice(nonce);
-
-    let plaintext = cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|e| format!("Decryption failed: {}", e))?;
-
-    if plaintext.len() != 32 {
-        return Err("Invalid plaintext length".to_string());
+    if buffer.len() != 32 {
+        return Err(MlsError::DecryptionError(format!(
+            "Decrypted data has wrong length: {}",
+            buffer.len()
+        )));
     }
 
     let mut result = [0u8; 32];
-    result.copy_from_slice(&plaintext);
+    result.copy_from_slice(&buffer);
     Ok(result)
 }
 
@@ -247,8 +281,14 @@ mod tests {
         ];
         let copath_subtrees = vec![[7u8; 32], [8u8; 32]];
 
-        let encrypted_secrets =
-            encrypt_to_copaths(&path_secrets, &sender_node_keys, &copath_subtrees);
+        let encrypted_secrets = encrypt_to_copaths(
+            &path_secrets,
+            &sender_node_keys,
+            &copath_subtrees,
+            [1u8; 16], // group_id
+            0,         // epoch
+            &[0, 1],   // node_indices
+        );
 
         // Verify we get one encrypted secret per copath subtree
         assert_eq!(encrypted_secrets.len(), copath_subtrees.len());
@@ -269,8 +309,11 @@ mod tests {
         // Encrypt
         let encrypted_secrets = encrypt_to_copaths(
             &[path_secret],
-            &[sender_keypair.clone()],
+            std::slice::from_ref(&sender_keypair),
             &[recipient_keypair.pk],
+            [1u8; 16], // group_id
+            0,         // epoch
+            &[0],      // node_indices
         );
 
         assert_eq!(encrypted_secrets.len(), 1);
@@ -282,6 +325,9 @@ mod tests {
             &sender_keypair.pk,
             &encrypted.nonce,
             &encrypted.ct,
+            [1u8; 16], // group_id
+            0,         // epoch
+            0,         // node_index
         );
 
         assert!(decrypted_secret.is_ok());
@@ -298,8 +344,11 @@ mod tests {
         // Encrypt with sender_keypair
         let encrypted_secrets = encrypt_to_copaths(
             &[path_secret],
-            &[sender_keypair.clone()],
+            std::slice::from_ref(&sender_keypair),
             &[recipient_keypair.pk],
+            [1u8; 16], // group_id
+            0,         // epoch
+            &[0],      // node_indices
         );
 
         assert_eq!(encrypted_secrets.len(), 1);
@@ -311,6 +360,9 @@ mod tests {
             &sender_keypair.pk,
             &encrypted.nonce,
             &encrypted.ct,
+            [1u8; 16], // group_id
+            0,         // epoch
+            0,         // node_index
         );
 
         // Should fail
@@ -337,68 +389,5 @@ mod tests {
         let different_prk = [2u8; 32];
         let result4 = hkdf_expand(&different_prk, info, length);
         assert_ne!(result1, result4);
-    }
-
-    #[test]
-    fn test_generate_nonce() {
-        let nonce1 = generate_nonce();
-        let nonce2 = generate_nonce();
-
-        // Nonces should be 12 bytes
-        assert_eq!(nonce1.len(), 12);
-        assert_eq!(nonce2.len(), 12);
-
-        // Nonces should be different (random)
-        assert_ne!(nonce1, nonce2);
-    }
-
-    #[test]
-    fn test_aead_encrypt_decrypt() {
-        let key = [42u8; 32];
-        let nonce = [1u8; 12];
-        let plaintext = [2u8; 32];
-
-        // Encrypt
-        let ciphertext = encrypt_aead(&key, &nonce, &plaintext);
-        assert!(!ciphertext.is_empty());
-
-        // Decrypt
-        let decrypted = decrypt_aead(&key, &nonce, &ciphertext);
-        assert!(decrypted.is_ok());
-        assert_eq!(decrypted.unwrap(), plaintext);
-    }
-
-    #[test]
-    fn test_aead_wrong_key_fails() {
-        let key1 = [42u8; 32];
-        let key2 = [43u8; 32];
-        let nonce = [1u8; 12];
-        let plaintext = [2u8; 32];
-
-        // Encrypt with key1
-        let ciphertext = encrypt_aead(&key1, &nonce, &plaintext);
-
-        // Try to decrypt with key2
-        let result = decrypt_aead(&key2, &nonce, &ciphertext);
-
-        // Should fail
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_aead_wrong_nonce_fails() {
-        let key = [42u8; 32];
-        let nonce1 = [1u8; 12];
-        let nonce2 = [2u8; 12];
-        let plaintext = [3u8; 32];
-
-        // Encrypt with nonce1
-        let ciphertext = encrypt_aead(&key, &nonce1, &plaintext);
-
-        // Try to decrypt with nonce2
-        let result = decrypt_aead(&key, &nonce2, &ciphertext);
-
-        // Should fail
-        assert!(result.is_err());
     }
 }

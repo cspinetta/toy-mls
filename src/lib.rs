@@ -4,6 +4,7 @@
 //! and experimentation, including ratchet trees, key management, and group state handling.
 
 pub mod crypto;
+pub mod error;
 pub mod group;
 pub mod messages;
 pub mod path_secrets;
@@ -11,6 +12,7 @@ pub mod tree;
 
 // Re-export main types for convenience
 pub use crypto::{KeyPair, Secrets, SigKeyPair};
+pub use error::{MlsError, MlsResult};
 pub use group::{GroupContext, GroupCreationResult, GroupState, WelcomeBundle, key_schedule};
 pub use messages::KeyPackage;
 pub use path_secrets::{

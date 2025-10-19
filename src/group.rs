@@ -2,18 +2,20 @@
 
 use crate::Secrets;
 use crate::crypto::{KeyPair, SigKeyPair};
+use crate::error::{MlsError, MlsResult};
 use crate::messages::Proposal;
 use crate::messages::{CipherForSubtree, Commit, KeyPackage, UpdatePathNode};
 use crate::path_secrets::{
     decrypt_start_secret, derive_path_up, encrypt_to_copaths, node_keys_from_path,
 };
-use crate::tree::{LeafIndex, RatchetTree};
+use crate::tree::{LeafIndex, NodeIndex, RatchetTree};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Group context containing group metadata
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GroupContext {
     pub group_id: [u8; 16],
     pub epoch: u64,
@@ -32,7 +34,7 @@ pub struct GroupState {
 }
 
 /// Welcome bundle for new group members
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct WelcomeBundle {
     pub group_id: [u8; 16],
     pub epoch: u64,
@@ -47,6 +49,22 @@ pub struct GroupCreationResult {
     pub creator_state: GroupState,
     pub welcome_bundle: WelcomeBundle,
     pub commit: Commit,
+}
+
+/// Result of preparing a commit
+#[derive(Debug)]
+pub struct CommitResult {
+    pub commit: Commit,
+    pub state_delta: StateDelta,
+}
+
+/// State delta for applying a commit
+#[derive(Clone, Debug)]
+pub struct StateDelta {
+    pub new_tree: RatchetTree,
+    pub new_context: GroupContext,
+    pub new_path_secrets: Vec<[u8; 32]>,
+    pub new_secrets: Secrets,
 }
 
 impl GroupState {
@@ -94,23 +112,23 @@ impl GroupState {
     }
 
     /// Compute the hash of the group context for confirmation
-    fn compute_group_context_hash(&self) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        hasher.update(self.context.group_id);
-        hasher.update(self.context.epoch.to_be_bytes());
-        hasher.update(self.context.tree_hash);
-        hasher.finalize().into()
+    pub fn compute_group_context_hash(&self) -> [u8; 32] {
+        context_hash(
+            self.context.group_id,
+            self.context.epoch,
+            self.context.tree_hash,
+        )
     }
 
     /// Create a new group with creator and other members
     ///
-    /// # Arguments
-    /// * `group_id` - Unique group identifier
-    /// * `creator_key_pkg` - Key package of the group creator
-    /// * `others_key_pkgs` - Key packages of other members
+    /// Implements MLS group creation as defined in RFC 9420 §12.1.
+    /// Creates initial group state with ratchet tree and epoch secrets.
     ///
-    /// # Returns
-    /// Group creation result with creator state, welcome bundle, and commit
+    /// # RFC 9420 Reference
+    /// - Section 12.1: Group Creation
+    /// - Section 7.2: TreeKEM Overview
+    /// - Section 7.4: Path Secret Derivation
     pub fn create_group(
         group_id: [u8; 16],
         creator_key_pkg: KeyPackage,
@@ -143,8 +161,14 @@ impl GroupState {
             .collect();
 
         // Encrypt path secrets to copath subtrees
-        let encrypted_secrets =
-            encrypt_to_copaths(&path_secrets, &sender_node_keys, &copath_subtree_pks);
+        let encrypted_secrets = encrypt_to_copaths(
+            &path_secrets,
+            &sender_node_keys,
+            &copath_subtree_pks,
+            group_id,
+            0, // epoch
+            &copath_nodes,
+        );
 
         // Create creator state
         let mut creator_state = GroupState {
@@ -178,7 +202,6 @@ impl GroupState {
             .zip(encrypted_secrets.iter())
             .map(|(node_key, encrypted)| UpdatePathNode {
                 node_public: node_key.pk,
-                path_secret: [0u8; 32], // Path secret is encrypted in the CipherForSubtree
                 encrypted_secrets: vec![encrypted.clone()], // One encrypted secret per copath
             })
             .collect();
@@ -197,15 +220,25 @@ impl GroupState {
         creator_state.update_tree_hash();
 
         // Create commit with proper confirmation tag
-        let group_context_hash = creator_state.compute_group_context_hash();
+        // Use epoch after commit (epoch + 1) for confirmation tag computation
+        let epoch_after = creator_state.context.epoch + 1;
+        let ctx_after = context_hash(
+            creator_state.context.group_id,
+            epoch_after,
+            creator_state.context.tree_hash,
+        );
         let confirmation_tag =
-            compute_confirmation_tag(&creator_state.secrets.conf_key, &group_context_hash);
+            compute_confirmation_tag(&creator_state.secrets.conf_key, &ctx_after);
 
-        let commit = Commit {
+        let mut commit = Commit {
             proposals: vec![],                    // No proposals for initial group creation
             update_path: Some(update_path_nodes), // Proper update path with sender node keys
             confirmation_tag,
+            signature: vec![], // Will be filled after signature computation
         };
+
+        // Compute signature over the commit
+        commit.signature = commit.compute_signature(&creator_state.my_sig.sk);
 
         GroupCreationResult {
             creator_state,
@@ -216,39 +249,58 @@ impl GroupState {
 
     /// Apply a commit to update group state
     ///
-    /// # Arguments
-    /// * `commit` - The commit to apply
-    /// * `encrypted_secrets` - Encrypted path secrets for this recipient
-    /// * `recipient_sk` - Recipient's subtree private key
-    /// * `sender_node_public_keys` - Public keys of sender's path nodes
+    /// Implements MLS commit application as defined in RFC 9420 §12.4.
+    /// Applies proposals, updates tree, and derives new epoch secrets.
     ///
-    /// # Returns
-    /// Updated group state or error
+    /// # RFC 9420 Reference
+    /// - Section 12.4: Processing a Commit
+    /// - Section 7.4: Path Secret Derivation
+    /// - Section 7.3: Update Paths
     pub fn apply_commit(
         &mut self,
         commit: &Commit,
         encrypted_secrets: &[CipherForSubtree],
         recipient_sk: &[u8; 32],
         sender_node_public_keys: &[[u8; 32]],
-    ) -> Result<(), String> {
-        // Decrypt path secrets
-        let mut decrypted_secrets = Vec::new();
+        sender_leaf: LeafIndex,
+    ) -> MlsResult<()> {
+        // Find which level contains this recipient's leaf
+        let level = self
+            .which_level_contains_my_leaf(sender_leaf, self.my_leaf)
+            .ok_or_else(|| {
+                MlsError::GroupError("Recipient leaf not found in sender's copath".to_string())
+            })?;
 
-        for (i, encrypted) in encrypted_secrets.iter().enumerate() {
-            // Use the corresponding sender's public key
-            let sender_node_pk = sender_node_public_keys
-                .get(i)
-                .ok_or_else(|| "Missing sender public key".to_string())?;
+        // Get the encrypted secret for this level
+        let encrypted = encrypted_secrets.get(level).ok_or_else(|| {
+            MlsError::GroupError("Missing encrypted secret for recipient's level".to_string())
+        })?;
 
-            match decrypt_start_secret(
-                recipient_sk,
-                sender_node_pk,
-                &encrypted.nonce,
-                &encrypted.ct,
-            ) {
-                Ok(secret) => decrypted_secrets.push(secret),
-                Err(e) => return Err(format!("Failed to decrypt secret: {}", e)),
-            }
+        // Use the corresponding sender's public key for this level
+        let sender_node_pk = sender_node_public_keys.get(level).ok_or_else(|| {
+            MlsError::GroupError("Missing sender public key for recipient's level".to_string())
+        })?;
+
+        // Decrypt the path secret for this level
+        let decrypted_secret = decrypt_start_secret(
+            recipient_sk,
+            sender_node_pk,
+            &encrypted.nonce,
+            &encrypted.ct,
+            self.context.group_id,
+            self.context.epoch,
+            encrypted.recipient_subtree_node as u32,
+        )
+        .map_err(|e| format!("Failed to decrypt secret: {}", e))?;
+
+        // Derive path secrets upward from this level
+        let mut decrypted_secrets = vec![decrypted_secret];
+        let mut current_secret = decrypted_secret;
+
+        // Derive secrets upward to the root
+        for _ in level..sender_node_public_keys.len() {
+            current_secret = hkdf_expand(&current_secret, b"mls10 path", 32);
+            decrypted_secrets.push(current_secret);
         }
 
         // Update my secrets with decrypted path secrets
@@ -257,31 +309,173 @@ impl GroupState {
         // Derive root secret and update epoch secrets
         self.secrets = key_schedule(&self.my_sec);
 
-        // Verify confirmation tag using HMAC
-        let group_context_hash = self.compute_group_context_hash();
-        let expected_confirmation =
-            compute_confirmation_tag(&self.secrets.conf_key, &group_context_hash);
-
-        if commit.confirmation_tag != expected_confirmation {
-            return Err("Invalid confirmation tag".to_string());
-        }
-
-        // Increment epoch
+        // Increment epoch first
         self.context.epoch += 1;
 
         // Update tree hash
         self.update_tree_hash();
 
+        // Verify confirmation tag using HMAC
+        // The confirmation tag should be computed with the epoch AFTER the commit is applied
+        let group_context_hash = self.compute_group_context_hash();
+        let expected_confirmation =
+            compute_confirmation_tag(&self.secrets.conf_key, &group_context_hash);
+
+        if commit.confirmation_tag != expected_confirmation {
+            return Err(MlsError::ConfirmationError(
+                "Invalid confirmation tag".to_string(),
+            ));
+        }
+
         Ok(())
     }
 
+    /// Apply a state delta to update the group state
+    pub fn apply_state_delta(&mut self, delta: StateDelta) -> Result<(), String> {
+        self.tree = delta.new_tree;
+        self.context = delta.new_context;
+        self.my_sec = delta.new_path_secrets;
+        self.secrets = delta.new_secrets;
+
+        // Increment epoch
+        self.context.epoch += 1;
+
+        Ok(())
+    }
+
+    /// Join a group from a welcome bundle
+    pub fn join_from_welcome(
+        bundle: &WelcomeBundle,
+        my_keypair: &KeyPair,
+        my_leaf_index: LeafIndex,
+    ) -> Result<Self, String> {
+        // Install the tree from the bundle
+        let tree = bundle.tree.clone();
+
+        // Verify that the leaf index is valid
+        if my_leaf_index >= tree.size {
+            return Err("Invalid leaf index for tree size".to_string());
+        }
+
+        // Create group context from bundle
+        let context = GroupContext {
+            group_id: bundle.group_id,
+            epoch: bundle.epoch,
+            tree_hash: tree.compute_tree_hash(),
+        };
+
+        // Find which level contains this joiner's leaf in the sender's copath
+        // We need to determine the sender's leaf index from the tree structure
+        // For simplicity, we'll assume the sender is leaf 0 (the creator)
+        let sender_leaf = 0;
+        let level = Self::which_level_contains_leaf_in_copath(&tree, sender_leaf, my_leaf_index)
+            .ok_or_else(|| "Joiner leaf not found in sender's copath".to_string())?;
+
+        // Get the encrypted secret for this level
+        let encrypted = bundle
+            .encrypted_path_secrets
+            .get(level)
+            .ok_or_else(|| "Missing encrypted secret for joiner's level".to_string())?;
+
+        // Use the corresponding sender's public key for this level
+        let sender_node_pk = bundle
+            .sender_node_public_keys
+            .get(level)
+            .ok_or_else(|| "Missing sender public key for joiner's level".to_string())?;
+
+        // Decrypt the path secret for this level
+        let decrypted_secret = decrypt_start_secret(
+            &my_keypair.sk,
+            sender_node_pk,
+            &encrypted.nonce,
+            &encrypted.ct,
+            bundle.group_id,
+            bundle.epoch,
+            encrypted.recipient_subtree_node as u32,
+        )
+        .map_err(|e| format!("Failed to decrypt secret: {}", e))?;
+
+        // Derive path secrets upward from this level
+        let mut path_secrets = vec![decrypted_secret];
+        let mut current_secret = decrypted_secret;
+
+        // Derive secrets upward to the root
+        for _ in level..bundle.sender_node_public_keys.len() {
+            current_secret = hkdf_expand(&current_secret, b"mls10 path", 32);
+            path_secrets.push(current_secret);
+        }
+
+        // Derive root → epoch → keys
+        let secrets = key_schedule(&path_secrets);
+
+        // Create the new group state
+        let group_state = GroupState {
+            context,
+            tree,
+            my_leaf: my_leaf_index,
+            my_sig: SigKeyPair::generate(), // Generate new signature key pair
+            my_sec: path_secrets,
+            secrets,
+        };
+
+        Ok(group_state)
+    }
+
+    /// Helper function to determine which level contains a leaf in a copath
+    fn which_level_contains_leaf_in_copath(
+        tree: &RatchetTree,
+        sender_leaf: LeafIndex,
+        recipient_leaf: LeafIndex,
+    ) -> Option<usize> {
+        let sender_copath = tree.copath(sender_leaf);
+
+        // Find which level of the copath contains the recipient's leaf
+        for (level, &copath_node) in sender_copath.iter().enumerate() {
+            // Check if the recipient's leaf is in the subtree rooted at this copath node
+            if Self::is_leaf_in_subtree_static(tree, recipient_leaf, copath_node) {
+                return Some(level);
+            }
+        }
+
+        None
+    }
+
+    /// Static helper function to check if a leaf is in a subtree
+    fn is_leaf_in_subtree_static(
+        tree: &RatchetTree,
+        leaf_index: LeafIndex,
+        subtree_root: NodeIndex,
+    ) -> bool {
+        let leaf_node_index = tree.size - 1 + leaf_index;
+
+        // If the subtree root is the leaf itself
+        if subtree_root == leaf_node_index {
+            return true;
+        }
+
+        // If the subtree root is a parent, check if the leaf is a descendant
+        Self::is_descendant_static(tree, leaf_node_index, subtree_root)
+    }
+
+    /// Static helper function to check if a node is a descendant of another node
+    fn is_descendant_static(
+        tree: &RatchetTree,
+        descendant: NodeIndex,
+        ancestor: NodeIndex,
+    ) -> bool {
+        let mut current = descendant;
+
+        while let Some(parent) = tree.parent(current) {
+            if parent == ancestor {
+                return true;
+            }
+            current = parent;
+        }
+
+        false
+    }
+
     /// Add a new member to the group
-    ///
-    /// # Arguments
-    /// * `new_member_key_pkg` - Key package of the new member
-    ///
-    /// # Returns
-    /// Updated group state and commit for the addition
     pub fn add_member(&mut self, new_member_key_pkg: KeyPackage) -> Result<Commit, String> {
         // Insert the new member into the tree
         let _new_leaf_index = self.tree.insert_leaf(new_member_key_pkg.clone());
@@ -320,7 +514,6 @@ impl GroupState {
             .zip(encrypted_secrets.iter())
             .map(|(node_key, encrypted)| UpdatePathNode {
                 node_public: node_key.pk,
-                path_secret: [0u8; 32], // Path secret is encrypted in the CipherForSubtree
                 encrypted_secrets: vec![encrypted.clone()], // One encrypted secret per copath
             })
             .collect();
@@ -336,15 +529,20 @@ impl GroupState {
         self.update_tree_hash();
 
         // Generate confirmation tag
-        let group_context_hash = self.compute_group_context_hash();
-        let confirmation_tag =
-            compute_confirmation_tag(&self.secrets.conf_key, &group_context_hash);
+        // Use epoch after commit (epoch + 1) for confirmation tag computation
+        let epoch_after = self.context.epoch + 1;
+        let ctx_after = context_hash(self.context.group_id, epoch_after, self.context.tree_hash);
+        let confirmation_tag = compute_confirmation_tag(&self.secrets.conf_key, &ctx_after);
 
-        let commit = Commit {
+        let mut commit = Commit {
             proposals,
             update_path: Some(update_path_nodes), // Proper update path with sender node keys
             confirmation_tag,
+            signature: vec![], // Will be filled after signature computation
         };
+
+        // Compute signature over the commit
+        commit.signature = commit.compute_signature(&self.my_sig.sk);
 
         // Increment epoch
         self.context.epoch += 1;
@@ -353,12 +551,6 @@ impl GroupState {
     }
 
     /// Remove a member from the group
-    ///
-    /// # Arguments
-    /// * `leaf_index` - Leaf index of the member to remove
-    ///
-    /// # Returns
-    /// Updated group state and commit for the removal
     pub fn remove_member(&mut self, leaf_index: LeafIndex) -> Result<Commit, String> {
         // Remove the member from the tree
         self.tree.remove_leaf(leaf_index);
@@ -375,20 +567,66 @@ impl GroupState {
         let dirpath = self.tree.dirpath(self.my_leaf);
         let new_path_secrets = derive_path_up(self.my_leaf, dirpath.len());
 
+        // Generate sender node keys from path secrets (one per path level)
+        let sender_node_keys: Vec<KeyPair> =
+            new_path_secrets.iter().map(node_keys_from_path).collect();
+
+        // Get copath subtree public keys from the actual tree
+        let copath_nodes = self.tree.copath(self.my_leaf);
+        let copath_subtree_pks: Vec<_> = copath_nodes
+            .iter()
+            .filter_map(|&node_idx| self.tree.get_node_public_key(node_idx))
+            .collect();
+
+        // Encrypt path secrets to copath subtrees
+        let encrypted_secrets = encrypt_to_copaths(
+            &new_path_secrets,
+            &sender_node_keys,
+            &copath_subtree_pks,
+            self.context.group_id,
+            self.context.epoch,
+            &copath_nodes,
+        );
+
+        // Create proper UpdatePath with sender node public keys and encrypted secrets
+        let update_path_nodes: Vec<UpdatePathNode> = sender_node_keys
+            .iter()
+            .zip(encrypted_secrets.iter())
+            .map(|(node_key, encrypted)| UpdatePathNode {
+                node_public: node_key.pk,
+                encrypted_secrets: vec![encrypted.clone()], // One encrypted secret per copath
+            })
+            .collect();
+
+        // Install new node public keys into the tree
+        for (i, node_key) in sender_node_keys.iter().enumerate() {
+            if let Some(node_index) = dirpath.get(i) {
+                self.tree.set_node_public_key(*node_index, node_key.pk)?;
+            }
+        }
+
+        // Update tree hash after installing new public keys
+        self.update_tree_hash();
+
         // Update our secrets
         self.my_sec = new_path_secrets;
         self.secrets = key_schedule(&self.my_sec);
 
         // Generate confirmation tag
-        let group_context_hash = self.compute_group_context_hash();
-        let confirmation_tag =
-            compute_confirmation_tag(&self.secrets.conf_key, &group_context_hash);
+        // Use epoch after commit (epoch + 1) for confirmation tag computation
+        let epoch_after = self.context.epoch + 1;
+        let ctx_after = context_hash(self.context.group_id, epoch_after, self.context.tree_hash);
+        let confirmation_tag = compute_confirmation_tag(&self.secrets.conf_key, &ctx_after);
 
-        let commit = Commit {
+        let mut commit = Commit {
             proposals,
-            update_path: Some(vec![]), // Simplified: empty update path
+            update_path: Some(update_path_nodes), // Proper update path with sender node keys
             confirmation_tag,
+            signature: vec![], // Will be filled after signature computation
         };
+
+        // Compute signature over the commit
+        commit.signature = commit.compute_signature(&self.my_sig.sk);
 
         // Increment epoch
         self.context.epoch += 1;
@@ -396,29 +634,177 @@ impl GroupState {
         Ok(commit)
     }
 
+    /// Prepare a commit with multiple proposals
+    pub fn prepare_commit(&self, proposals: Vec<Proposal>) -> Result<CommitResult, String> {
+        // Clone current tree to a scratch tree
+        let mut scratch_tree = self.tree.clone();
+        let mut scratch_context = self.context.clone();
+
+        // Apply proposals on the scratch tree
+        for proposal in &proposals {
+            match proposal {
+                Proposal::Add { key_package } => {
+                    scratch_tree.insert_leaf(key_package.clone());
+                }
+                Proposal::Remove { removed } => {
+                    scratch_tree.remove_leaf(*removed);
+                }
+                Proposal::Update => {
+                    // Update proposal doesn't change tree topology
+                }
+            }
+        }
+
+        // Update tree hash after applying proposals
+        scratch_context.tree_hash = scratch_tree.compute_tree_hash();
+
+        // On the committer's leaf in the scratch tree, derive path secrets
+        let dirpath = scratch_tree.dirpath(self.my_leaf);
+        let new_path_secrets = derive_path_up(self.my_leaf, dirpath.len());
+
+        // Generate sender node keys from path secrets (one per path level)
+        let sender_node_keys: Vec<KeyPair> =
+            new_path_secrets.iter().map(node_keys_from_path).collect();
+
+        // Get copath subtree public keys from the actual tree
+        let copath_nodes = scratch_tree.copath(self.my_leaf);
+        let copath_subtree_pks: Vec<_> = copath_nodes
+            .iter()
+            .filter_map(|&node_idx| scratch_tree.get_node_public_key(node_idx))
+            .collect();
+
+        // Encrypt path secrets to copath subtrees
+        let encrypted_secrets = encrypt_to_copaths(
+            &new_path_secrets,
+            &sender_node_keys,
+            &copath_subtree_pks,
+            scratch_context.group_id,
+            scratch_context.epoch,
+            &copath_nodes,
+        );
+
+        // Create proper UpdatePath with sender node public keys and encrypted secrets
+        let update_path_nodes: Vec<UpdatePathNode> = sender_node_keys
+            .iter()
+            .zip(encrypted_secrets.iter())
+            .map(|(node_key, encrypted)| UpdatePathNode {
+                node_public: node_key.pk,
+                encrypted_secrets: vec![encrypted.clone()], // One encrypted secret per copath
+            })
+            .collect();
+
+        // Install new node public keys into the scratch tree
+        for (i, node_key) in sender_node_keys.iter().enumerate() {
+            if let Some(node_index) = dirpath.get(i) {
+                scratch_tree.set_node_public_key(*node_index, node_key.pk)?;
+            }
+        }
+
+        // Update tree hash after installing new public keys
+        scratch_context.tree_hash = scratch_tree.compute_tree_hash();
+
+        // Derive new epoch secrets
+        let new_secrets = key_schedule(&new_path_secrets);
+
+        // Compute confirmation tag
+        let epoch_after = scratch_context.epoch + 1;
+        let ctx_after = context_hash(
+            scratch_context.group_id,
+            epoch_after,
+            scratch_context.tree_hash,
+        );
+        let confirmation_tag = compute_confirmation_tag(&new_secrets.conf_key, &ctx_after);
+
+        let mut commit = Commit {
+            proposals,
+            update_path: Some(update_path_nodes),
+            confirmation_tag,
+            signature: vec![], // Will be filled after signature computation
+        };
+
+        // Compute signature over the commit
+        commit.signature = commit.compute_signature(&self.my_sig.sk);
+
+        // Create state delta
+        let state_delta = StateDelta {
+            new_tree: scratch_tree,
+            new_context: scratch_context,
+            new_path_secrets,
+            new_secrets,
+        };
+
+        Ok(CommitResult {
+            commit,
+            state_delta,
+        })
+    }
+
     /// Create an empty commit (epoch advancement without membership change)
-    ///
-    /// # Returns
-    /// Commit for epoch advancement
     pub fn empty_commit(&mut self) -> Result<Commit, String> {
         // Generate new path secrets (same tree, but new secrets for forward secrecy)
         let dirpath = self.tree.dirpath(self.my_leaf);
         let new_path_secrets = derive_path_up(self.my_leaf, dirpath.len());
 
+        // Generate sender node keys from path secrets (one per path level)
+        let sender_node_keys: Vec<KeyPair> =
+            new_path_secrets.iter().map(node_keys_from_path).collect();
+
+        // Get copath subtree public keys from the actual tree
+        let copath_nodes = self.tree.copath(self.my_leaf);
+        let copath_subtree_pks: Vec<_> = copath_nodes
+            .iter()
+            .filter_map(|&node_idx| self.tree.get_node_public_key(node_idx))
+            .collect();
+
+        // Encrypt path secrets to copath subtrees
+        let encrypted_secrets = encrypt_to_copaths(
+            &new_path_secrets,
+            &sender_node_keys,
+            &copath_subtree_pks,
+            self.context.group_id,
+            self.context.epoch,
+            &copath_nodes,
+        );
+
+        // Create proper UpdatePath with sender node public keys and encrypted secrets
+        let update_path_nodes: Vec<UpdatePathNode> = sender_node_keys
+            .iter()
+            .zip(encrypted_secrets.iter())
+            .map(|(node_key, encrypted)| UpdatePathNode {
+                node_public: node_key.pk,
+                encrypted_secrets: vec![encrypted.clone()], // One encrypted secret per copath
+            })
+            .collect();
+
+        // Install new node public keys into the tree
+        for (i, node_key) in sender_node_keys.iter().enumerate() {
+            if let Some(node_index) = dirpath.get(i) {
+                self.tree.set_node_public_key(*node_index, node_key.pk)?;
+            }
+        }
+
+        // Update tree hash after installing new public keys
+        self.update_tree_hash();
+
         // Update our secrets
         self.my_sec = new_path_secrets;
         self.secrets = key_schedule(&self.my_sec);
 
         // Generate confirmation tag
-        let group_context_hash = self.compute_group_context_hash();
-        let confirmation_tag =
-            compute_confirmation_tag(&self.secrets.conf_key, &group_context_hash);
+        // Use epoch after commit (epoch + 1) for confirmation tag computation
+        let epoch_after = self.context.epoch + 1;
+        let ctx_after = context_hash(self.context.group_id, epoch_after, self.context.tree_hash);
+        let confirmation_tag = compute_confirmation_tag(&self.secrets.conf_key, &ctx_after);
 
-        let commit = Commit {
-            proposals: vec![],         // No proposals - just epoch advancement
-            update_path: Some(vec![]), // Simplified: empty update path
+        let mut commit = Commit {
+            proposals: vec![],                    // No proposals - just epoch advancement
+            update_path: Some(update_path_nodes), // Proper update path with sender node keys
             confirmation_tag,
+            signature: vec![], // Will be filled after signature computation
         };
+
+        // Compute signature over the commit
+        commit.signature = commit.compute_signature(&self.my_sig.sk);
 
         // Increment epoch
         self.context.epoch += 1;
@@ -426,14 +812,81 @@ impl GroupState {
         Ok(commit)
     }
 
+    /// Create a truly empty commit (no proposals, no path update)
+    ///
+    /// This is a didactic function to demonstrate that commits can advance the epoch
+    /// without changing membership or secrets. In a real MLS implementation, this would
+    /// typically not be used, as commits usually carry proposals or update paths.
+    pub fn truly_empty_commit(&mut self) -> Result<Commit, String> {
+        // Generate confirmation tag using current secrets
+        // Use epoch after commit (epoch + 1) for confirmation tag computation
+        let epoch_after = self.context.epoch + 1;
+        let ctx_after = context_hash(self.context.group_id, epoch_after, self.context.tree_hash);
+        let confirmation_tag = compute_confirmation_tag(&self.secrets.conf_key, &ctx_after);
+
+        let mut commit = Commit {
+            proposals: vec![], // No proposals
+            update_path: None, // No path update
+            confirmation_tag,
+            signature: vec![], // Will be filled after signature computation
+        };
+
+        // Compute signature over the commit
+        commit.signature = commit.compute_signature(&self.my_sig.sk);
+
+        // Increment epoch
+        self.context.epoch += 1;
+
+        Ok(commit)
+    }
+
+    /// Determine which level of the sender's direct path contains the recipient's leaf
+    pub fn which_level_contains_my_leaf(
+        &self,
+        sender_leaf: LeafIndex,
+        recipient_leaf: LeafIndex,
+    ) -> Option<usize> {
+        let sender_copath = self.tree.copath(sender_leaf);
+
+        // Find which level of the copath contains the recipient's leaf
+        for (level, &copath_node) in sender_copath.iter().enumerate() {
+            // Check if the recipient's leaf is in the subtree rooted at this copath node
+            if self.is_leaf_in_subtree(recipient_leaf, copath_node) {
+                return Some(level);
+            }
+        }
+
+        None
+    }
+
+    /// Check if a leaf is in the subtree rooted at a given node
+    fn is_leaf_in_subtree(&self, leaf_index: LeafIndex, subtree_root: NodeIndex) -> bool {
+        let leaf_node_index = self.tree.size - 1 + leaf_index;
+
+        // If the subtree root is the leaf itself
+        if subtree_root == leaf_node_index {
+            return true;
+        }
+
+        // If the subtree root is a parent, check if the leaf is a descendant
+        self.is_descendant(leaf_node_index, subtree_root)
+    }
+
+    /// Check if a node is a descendant of another node
+    fn is_descendant(&self, descendant: NodeIndex, ancestor: NodeIndex) -> bool {
+        let mut current = descendant;
+
+        while let Some(parent) = self.tree.parent(current) {
+            if parent == ancestor {
+                return true;
+            }
+            current = parent;
+        }
+
+        false
+    }
+
     /// Verify a commit signature using the sender's signature key
-    ///
-    /// # Arguments
-    /// * `commit` - The commit to verify
-    /// * `sender_sig_pk` - The sender's signature public key
-    ///
-    /// # Returns
-    /// Result indicating if the signature is valid
     pub fn verify_commit_signature(
         &self,
         commit: &Commit,
@@ -444,10 +897,10 @@ impl GroupState {
 
         // The confirmation tag serves as our "signature" verification
         // It proves that the sender has the correct conf_key for this epoch
-        // Note: The confirmation tag is computed with the epoch BEFORE the commit is applied
-        let group_context_hash = self.compute_group_context_hash();
-        let expected_confirmation =
-            compute_confirmation_tag(&self.secrets.conf_key, &group_context_hash);
+        // Note: The confirmation tag is computed with the epoch AFTER the commit is applied
+        let epoch_after = self.context.epoch + 1;
+        let ctx_after = context_hash(self.context.group_id, epoch_after, self.context.tree_hash);
+        let expected_confirmation = compute_confirmation_tag(&self.secrets.conf_key, &ctx_after);
 
         if commit.confirmation_tag != expected_confirmation {
             return Err("Invalid commit signature/confirmation".to_string());
@@ -461,12 +914,6 @@ impl GroupState {
 ///
 /// Implements the MLS key schedule as defined in RFC 9420 §7.2.
 /// Derives epoch secrets from the root secret using HKDF-Expand.
-///
-/// # Arguments
-/// * `path_secrets` - Vector of path secrets (last one is root secret)
-///
-/// # Returns
-/// Current epoch secrets
 pub fn key_schedule(path_secrets: &[[u8; 32]]) -> Secrets {
     // Get root secret (last path secret)
     let root_secret = path_secrets.last().copied().unwrap_or([0u8; 32]);
@@ -491,6 +938,18 @@ pub fn key_schedule(path_secrets: &[[u8; 32]]) -> Secrets {
     }
 }
 
+/// Context hash helper function
+///
+/// Computes the hash of group context for confirmation tag computation.
+/// This follows the MLS specification for group context hashing.
+pub fn context_hash(group_id: [u8; 16], epoch: u64, tree_hash: [u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(group_id);
+    hasher.update(epoch.to_be_bytes());
+    hasher.update(tree_hash);
+    hasher.finalize().into()
+}
+
 /// HKDF-Expand helper function
 fn hkdf_expand(prk: &[u8], info: &[u8], length: usize) -> [u8; 32] {
     let hk = Hkdf::<Sha256>::from_prk(prk).expect("Invalid PRK length");
@@ -506,7 +965,7 @@ fn hkdf_expand(prk: &[u8], info: &[u8], length: usize) -> [u8; 32] {
 ///
 /// Implements the MLS confirmation tag computation as defined in RFC 9420 §6.1.
 /// Uses HMAC-SHA256 with the confirmation key and group context hash.
-fn compute_confirmation_tag(
+pub fn compute_confirmation_tag(
     confirmation_key: &[u8; 32],
     group_context_hash: &[u8; 32],
 ) -> [u8; 32] {
@@ -767,6 +1226,7 @@ mod tests {
             &group_result.welcome_bundle.encrypted_path_secrets,
             &recipient_sk,
             &group_result.welcome_bundle.sender_node_public_keys,
+            0, // sender_leaf (creator is leaf 0)
         );
 
         // Should fail with mock keys (expected behavior)
