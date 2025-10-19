@@ -49,17 +49,17 @@ jobs:
       run: cargo clippy --all-targets --all-features -- -D warnings
     
     - name: Run tests (default features)
-      if: matrix.features == ""
+      if: matrix.features == ''
       run: cargo test --verbose
     
     - name: Run tests (with RFC treemath)
-      if: matrix.features == "rfc_treemath"
+      if: matrix.features == 'rfc_treemath'
       run: cargo test --features rfc_treemath --verbose
     
     - name: Run examples
       run: |
         cargo run --example tree_math_comparison
-        if [ "${{ matrix.features }}" = "rfc_treemath" ]; then
+        if [ "${{ matrix.features }}" = 'rfc_treemath' ]; then
           cargo run --example tree_math_comparison --features rfc_treemath
         fi
     
