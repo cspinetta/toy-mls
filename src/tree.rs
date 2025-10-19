@@ -411,13 +411,7 @@ impl RatchetTree {
             if level < depth - 1 {
                 let mut branch_line = String::new();
                 for _ in 0..level_size {
-                    write!(
-                        branch_line,
-                        "{:^width$}",
-                        "/   \\",
-                        width = spacing * 3
-                    )
-                    .unwrap();
+                    write!(branch_line, "{:^width$}", "/   \\", width = spacing * 3).unwrap();
                 }
                 println!("{}", branch_line);
             }
