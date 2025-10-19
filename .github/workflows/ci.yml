@@ -63,8 +63,13 @@ jobs:
           cargo run --example tree_math_comparison --features rfc_treemath
         fi
     
-    - name: Build documentation
-      run: cargo doc --no-deps --features ${{ matrix.features }}
+    - name: Build documentation (default features)
+      if: matrix.features == ''
+      run: cargo doc --no-deps
+    
+    - name: Build documentation (with RFC treemath)
+      if: matrix.features == 'rfc_treemath'
+      run: cargo doc --no-deps --features rfc_treemath
 
   security-audit:
     name: Security Audit
