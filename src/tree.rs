@@ -354,48 +354,40 @@ impl RatchetTree {
         count
     }
 
-    /// Pretty-print the tree as ASCII structure
+    /// Pretty-print the tree as an ASCII diagram.
     ///
-    /// Displays the current in-memory tree layout showing each node's
-    /// index, type (Parent/Leaf/Blank), and short public key prefix.
-    /// This helps visualize tree evolution across commits.
-    ///
-    /// # Example
-    /// ```
-    /// let tree = RatchetTree::new(3);
-    /// tree.print_ascii(); // prints 3-leaf tree layout
-    /// ```
-    ///
-    /// Output (for N=3):
-    /// ```text
-    /// Level 0: [ 0] Parent(...)
-    /// Level 1: [ 1] Parent(...) [ 2] Leaf(2)
-    /// Level 2: [ 3] Leaf(0) [ 4] Leaf(1)
-    /// ```
+    /// Renders the tree level by level with connecting branches,
+    /// showing parent/child relationships and short key identifiers.
     pub fn print_ascii(&self) {
         use std::fmt::Write;
 
+        if self.nodes.is_empty() {
+            println!("(empty tree)");
+            return;
+        }
+
         println!("\n=== Current Ratchet Tree ===");
 
+        // Compute tree depth
+        let depth = (self.nodes.len() as f64 + 1.0).log2().ceil() as usize;
         let mut level_start = 0;
         let mut level_size = 1;
-        let mut level = 0;
-        let mut output = String::new();
 
-        while level_start < self.nodes.len() {
-            write!(&mut output, "Level {}: ", level).unwrap();
+        for level in 0..depth {
+            // Compute horizontal spacing (inversely proportional to level depth)
+            let spacing = 2_usize.pow((depth - level) as u32);
+            let mut line = String::new();
 
+            // Print node row
             for i in level_start..(level_start + level_size).min(self.nodes.len()) {
-                match &self.nodes[i] {
-                    Node::Blank => write!(&mut output, "[{:2}] Blank  ", i).unwrap(),
+                let label = match &self.nodes[i] {
+                    Node::Blank => format!("[{:2}] Blank", i),
                     Node::Parent { node_pk } => {
-                        write!(
-                            &mut output,
-                            "[{:2}] Parent({:02x?})  ",
-                            i,
-                            &node_pk[..4]
+                        use colored::*;
+                        format!(
+                            "{}",
+                            format!("[{:2}] P({:02x?})", i, &node_pk[..2]).bright_blue()
                         )
-                        .unwrap();
                     }
                     Node::Leaf { leaf_pk, .. } => {
                         let leaf_idx = if self.size > 0 && i >= self.size - 1 {
@@ -403,25 +395,38 @@ impl RatchetTree {
                         } else {
                             i
                         };
-                        write!(
-                            &mut output,
-                            "[{:2}] Leaf({}) {:02x?}  ",
-                            i,
-                            leaf_idx,
-                            &leaf_pk[..4]
+                        use colored::*;
+                        format!(
+                            "{}",
+                            format!("[{:2}] L{}({:02x?})", i, leaf_idx, &leaf_pk[..2]).green()
                         )
-                        .unwrap();
                     }
-                }
+                };
+                write!(line, "{:^width$}", label, width = spacing * 3).unwrap();
             }
 
-            output.push('\n');
+            println!("{}", line);
+
+            // Print branch connectors
+            if level < depth - 1 {
+                let mut branch_line = String::new();
+                for _ in 0..level_size {
+                    write!(
+                        branch_line,
+                        "{:^width$}",
+                        "/   \\",
+                        width = spacing * 3
+                    )
+                    .unwrap();
+                }
+                println!("{}", branch_line);
+            }
+
+            // Move to next level
             level_start += level_size;
             level_size *= 2;
-            level += 1;
         }
 
-        println!("{}", output);
         println!("============================\n");
     }
 }

@@ -25,7 +25,33 @@ MLS provides advanced security features including:
 * **Tree public key installation** after commits
 
 This implementation focuses on **clarity and pedagogy**, not production security.
-It’s meant for engineers and students who want to **understand MLS by building it**.
+It's meant for engineers and students who want to **understand MLS by building it**.
+
+## What's Intentionally Simplified
+
+This educational implementation makes several intentional simplifications to focus on core MLS concepts:
+
+### Tree Indexing
+- **Default**: Uses heap-style indexing (root=0, left=2i+1, right=2i+2) for easier visualization
+- **RFC 9420**: Available via `rfc_treemath` feature for specification compliance
+- Both implementations are tested and functional
+
+### Cryptographic Patterns
+- **HPKE-style**: Uses simplified HPKE-like key derivation patterns instead of full HPKE
+- **Key derivation**: Uses HKDF-Expand with MLS-specific labels for educational clarity
+- **Path secrets**: Uses symmetric HKDF expansion instead of per-node HPKE encryption chains
+- **Signatures**: Uses Ed25519 for simplicity, though MLS supports multiple schemes
+
+### Confirmation Mechanism
+- **Primary check**: Uses confirmation tags as the primary validation mechanism in this toy implementation
+- **Simplified**: In production MLS, confirmation tags are one of several validation steps
+- **Educational**: Focuses on the core concept of shared secret validation
+
+### Error Handling
+- **Simplified**: Uses basic error types instead of the full MLS error taxonomy
+- **Educational**: Focuses on core error conditions rather than edge cases
+
+These simplifications make the code more readable and educational while maintaining the essential MLS security properties and concepts.
 
 ## Prerequisites
 

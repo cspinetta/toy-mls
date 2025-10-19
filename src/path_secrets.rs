@@ -63,6 +63,10 @@ pub fn node_keys_from_path(path_secret: &[u8; 32]) -> KeyPair {
 /// Implements MLS path secret encryption as defined in RFC 9420 §7.4.
 /// Encrypts path secrets to copath subtrees using HPKE-style patterns.
 ///
+/// NOTE: This educational version uses simplified HPKE-style patterns instead of
+/// full HPKE as defined in RFC 9420. This keeps the implementation easier to follow
+/// while maintaining the core security properties.
+///
 /// This implementation follows HPKE patterns using compatible dependencies:
 /// - X25519 for key exchange
 /// - HKDF for key derivation  
@@ -112,7 +116,7 @@ pub fn encrypt_to_copaths(
         let ciphertext = encrypt_with_ad(&key, &nonce, path_secret, &aad);
 
         encrypted_secrets.push(CipherForSubtree {
-            recipient_subtree_node: subtree_idx,
+            subtree_root_node_index: node_index as usize,
             nonce,
             ct: ciphertext,
         });

@@ -18,7 +18,7 @@ pub struct UpdatePathNode {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CipherForSubtree {
-    pub recipient_subtree_node: NodeIndex,
+    pub subtree_root_node_index: NodeIndex,
     pub nonce: [u8; 12],
     pub ct: Vec<u8>, // AEAD over path secret s[i]
 }
